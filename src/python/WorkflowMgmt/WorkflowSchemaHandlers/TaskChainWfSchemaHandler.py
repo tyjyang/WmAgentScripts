@@ -2,8 +2,9 @@ import re
 import copy
 from logging import Logger
 from collections import defaultdict
-
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Any
+import traceback
+import json
 
 from Utilities.IteratorTools import filterKeys
 from WorkflowMgmt.WorkflowSchemaHandlers.StepChainWfSchemaHandler import StepChainWfSchemaHandler
@@ -26,6 +27,7 @@ class TaskChainWfSchemaHandler(StepChainWfSchemaHandler):
                 "largeOutputSize": "The output size task is expected to be too large: %.2f GB > %f GB even for one lumi (effective lumi size is ~%d). It should go as low as %d",
                 "largeOutputTime": "The running time of task is expected to be too large even for one lumi section: %s x %.2f s = %.2f h. It should go as low as %s",
                 "reduceLargeOutput": "The output size of task is expected to be too large : %d x %.2f kB * %.4f = %.2f GB > %f GB. Reducing to %d",
+                "diffMulticoreConversion": "The conversion to StepChain encoutered different value of Multicore: %s != %s"
             }
 
         except Exception as error:
@@ -60,14 +62,29 @@ class TaskChainWfSchemaHandler(StepChainWfSchemaHandler):
             totalTimePerEvent += info["timePerEvent"]
             efficiency += info["timePerEvent"] * min(info["cores"], maxCores)
 
-        self.logger.debug("Total time per event for TaskChain: %0.1f", totalTimePerEvent)
+        self.logger.info("Total time per event for TaskChain: %0.1f", totalTimePerEvent)
 
         if totalTimePerEvent:
             efficiency /= totalTimePerEvent * maxCores
-            self.logger.debug("CPU efficiency of StepChain with %u cores: %0.1f%%", maxCores, efficiency * 100)
-            return efficiency > self.unifiedConfiguration.get("efficiency_threshold_for_stepchain")
+            self.logger.info("CPU efficiency of StepChain with %u cores: %0.1f%%", maxCores, efficiency * 100)
+            return efficiency > self._getStepchainConversionThreshold()
 
         return False
+
+    def _getStepchainConversionThreshold(self) -> float:
+
+        try:
+
+            priority = self.get("RequestPriority")
+            if priority >= self.unifiedConfiguration.get("block1_priority"):
+                return self.unifiedConfiguration.get("efficiency_threshold_for_stepchain_high_priority")
+            else:
+                return self.unifiedConfiguration.get("efficiency_threshold_for_stepchain_low_priority")
+
+        except Exception as error:
+            self.logger.error("Failed to get the stepchain conversion threshold")
+            self.logger.error(str(error))
+
 
     def _hasNonZeroEventStreams(self) -> bool:
         """
@@ -87,12 +104,40 @@ class TaskChainWfSchemaHandler(StepChainWfSchemaHandler):
         :param efficiencyFactor: starting efficiency factor
         :return: efficiency factor
         """
-        if "InputTask" in schema:
-            dataset = self._getTaskSchema(schema["InputTask"])
-            efficiencyFactor *= dataset.get("FilterEfficiency", 1.0)
-            return self._getTaskEfficiencyFactor(dataset, efficiencyFactor)
+        if "InputStep" in schema:
+            inputStepSchema = self._getTaskSchema(schema["InputStep"])
+            efficiencyFactor *= inputStepSchema.get("FilterEfficiency", 1.0)
+            return self._getTaskEfficiencyFactor(inputStepSchema, efficiencyFactor)
 
         return efficiencyFactor
+
+    def _getMulticoreFactor(self, schema: dict) -> float:
+        """
+        The function to get the nCores factor for a given task
+        :param schema: task schema
+        :return: nCores factor
+        """
+        stepchainMulticore, stepchainMemory = self._getStepChainMulticoreMemory()
+        return schema["Multicore"]/stepchainMulticore
+
+
+    def _getStepChainMulticoreMemory(self) -> Tuple[int, int]:
+        """
+        The function to get the multicore and memory values of the stepchain
+        :return: multicore & memory
+        """
+        multicore, memory = 0, 0
+        for key in self.chainKeys:
+            taskName = "Task{}".format(re.findall(r'\d+', key)[0])
+            multicore = max(multicore, self.wfSchema[taskName].get("Multicore"))
+            memory = max(memory, self.wfSchema[taskName].get("Memory"))
+
+        # If either multicore or memory exceeds the threshold, we use the threshold
+        if multicore > self.unifiedConfiguration.get("max_nCores_for_stepchain") or memory > self.unifiedConfiguration.get("max_memory_for_stepchain"):
+            multicore = self.unifiedConfiguration.get("max_nCores_for_stepchain")
+            memory = self.unifiedConfiguration.get("max_memory_for_stepchain")
+
+        return multicore, memory
 
     def _getTaskSchema(self, task: str) -> dict:
         """
@@ -101,7 +146,7 @@ class TaskChainWfSchemaHandler(StepChainWfSchemaHandler):
         :return: task schema
         """
         for _, schema in filterKeys(self.chainKeys, self.wfSchema).items():
-            if schema[f"{self.base}Name"] == task:
+            if schema[f"StepName"] == task:
                 return copy.deepcopy(schema)
         return {}
 
@@ -223,33 +268,90 @@ class TaskChainWfSchemaHandler(StepChainWfSchemaHandler):
         :return: True if good, False o/w
         """
         try:
-            if self._hasNonZeroEventStreams():
-                self.logger.info("Convertion is supported only when EventStreams are zero")
-                return False
-
-            moreThanOneTask = self.get("TaskChain", 0) > 1
 
             tiers = [*map(lambda x: x.split("/")[-1], self.get("OutputDatasets", []))]
-            allUniqueTiers = len(tiers) == len(set(tiers))
-
-            allSameArches = len(set(map(lambda x: x[:4], self.getParamList("ScramArch")))) == 1
-
-            allSameCores = len(set(self.getMulticore(maxOnly=False))) == 1
-
             processingString = "".join(f"{k}{v}" for k, v in self.getProcessingString().items())
             foundKeywords = any(keyword in processingString + self.wf for keyword in keywords) if keywords else True
 
+            relValCheck = not self.isRelVal()
+            efficiencyCheck = self._hasAcceptableEfficiency()
+            dataTierCheck = len(tiers) == len(set(tiers))
+            archCheck = len(set(map(lambda x: x[:4], self.getParamList("ScramArch")))) == 1 # All steps should have the same architecture
+            keywordCheck = any(keyword in processingString + self.wf for keyword in keywords) if keywords else True
+            nTaskCheck = self.get("TaskChain", 0) > 1
+            eventStreamCheck = not self._hasNonZeroEventStreams()
+
+            self.logger.info(f"Stepchain criteria: RelVal check: {relValCheck}")
+            self.logger.info(f"Stepchain criteria: Efficiency check: {efficiencyCheck}")
+            self.logger.info(f"Stepchain criteria: Data tier check: {dataTierCheck}")
+            self.logger.info(f"Stepchain criteria: Architecture check: {archCheck}")
+            self.logger.info(f"Stepchain criteria: Keyword check: {keywordCheck}")
+            self.logger.info(f"Stepchain criteria: # of tasks check: {nTaskCheck}")
+            self.logger.info(f"Stepchain criteria: Event Stream check: {eventStreamCheck}")
+
             return (
-                moreThanOneTask
-                and allUniqueTiers
-                and allSameArches
-                and (allSameCores or self._hasAcceptableEfficiency())
-                and foundKeywords
+                relValCheck
+                and efficiencyCheck
+                and dataTierCheck
+                and archCheck
+                and keywordCheck
+                and nTaskCheck
+                and eventStreamCheck
             )
 
         except Exception as error:
             self.logger.error("Failed to check if good to convert to step chain")
             self.logger.error(str(error))
+
+    def convertToStepChain(self) -> object:
+        """
+        The function to convert the request to step chain
+        :return: a StepChainWfSchemaHandler if the convertion is possible, itself o/w
+        """
+        try:
+            stepNames = {}
+
+            convertedWfSchema = self.wfSchema.copy()
+            convertedWfSchema["RequestType"] = "StepChain"
+            convertedWfSchema["StepChain"] = convertedWfSchema.pop("TaskChain")
+            convertedWfSchema["TimePerEvent"] = 0
+            convertedWfSchema["SizePerEvent"] = 0
+
+            # Get these values before they're popped from the dictionary
+            stepchainMulticore, stepchainMemory = self._getStepChainMulticoreMemory()
+
+            for key in self.chainKeys:
+                stepName = "Step{}".format(re.findall(r'\d+', key)[0])
+                convertedWfSchema[stepName] = convertedWfSchema.pop(key)
+                convertedWfSchema[stepName]["StepName"] = convertedWfSchema[stepName].pop("TaskName")
+                stepNames[convertedWfSchema[stepName]["StepName"]] = stepName
+                if "InputTask" in convertedWfSchema[stepName]:
+                    convertedWfSchema[stepName]["InputStep"] = convertedWfSchema[stepName].pop("InputTask")
+
+                # TimePerEvent & SizePerEvent Setting
+                efficiencyFactor = self._getTaskEfficiencyFactor(self.wfSchema[key])
+                # Suppress multicore factor to avoid undercalculation of TpE in case not multicore friendly tasks
+                # multicoreFactor = self._getMulticoreFactor(self.wfSchema[key])
+                convertedWfSchema["TimePerEvent"] += efficiencyFactor * convertedWfSchema[stepName].pop("TimePerEvent") #* multicoreFactor
+                convertedWfSchema["SizePerEvent"] += efficiencyFactor * convertedWfSchema[stepName].pop("SizePerEvent") #* multicoreFactor
+
+                if "KeepOutput" not in convertedWfSchema[stepName]:
+                    convertedWfSchema[stepName]["KeepOutput"] = False
+
+                # Get rid of step/task level core and memory values
+                convertedWfSchema[stepName].pop("Multicore")
+                convertedWfSchema[stepName].pop("Memory")
+
+            # Multicore and Memory setting
+            convertedWfSchema["Multicore"] = stepchainMulticore
+            convertedWfSchema["Memory"] = stepchainMemory
+
+            return StepChainWfSchemaHandler(convertedWfSchema)
+
+        except Exception as error:
+            self.logger.error("Failed to convert workflow to step chain")
+            self.logger.error(str(error))
+            self.logger.error(traceback.format_exc())
 
     def getRequestNumEvents(self) -> int:
         """
@@ -294,7 +396,7 @@ class TaskChainWfSchemaHandler(StepChainWfSchemaHandler):
             self.logger.error("Failed to get blowup factors")
             self.logger.error(str(error))
 
-    def checkSplitting(self, splittings: dict) -> Tuple[bool, list]:
+    def checkSplittings(self, splittings: dict) -> Tuple[bool, list]:
         """
         The function to check the splittings sizes and if any action is required
         :param splittings: splittings schema
@@ -368,3 +470,93 @@ class TaskChainWfSchemaHandler(StepChainWfSchemaHandler):
         except Exception as error:
             self.logger.error("Failed to write dataset pattern name for %s", elements)
             self.logger.error(str(error))
+
+    def setMemory(self, memory: int) -> None:
+        """
+        The function to set a given memory value to the workflow schema
+        :param memory: new memory value
+        """
+        try:
+            for key in self.chainKeys:
+                self.wfSchema[key]["Memory"] = memory
+        
+        except Exception as error:
+            self.logger.error("Failed to set memory to schema")
+            self.logger.error(str(error))
+
+    def setMulticore(self, multicore: int, tasks: Optional[List[str]] = None) -> None:
+        """
+        The function to set a given multicore value to the workflow schema
+        :param multicore: new multicore value
+        :param tasks: tasks names
+        """
+        try:
+            for key, task in filterKeys(self.chainKeys, self.wfSchema).items():
+                if key not in tasks and task.get("TaskName") not in tasks:
+                    continue
+                
+                memoryPerCore = int(0.6 * task.get("Memory") / task.get("Multicore"))
+                self.logger.info("%s: %s of memory per core, %s of base memory", key, memoryPerCore, task.get("Memory"))
+
+                self.wfSchema[key]["Memory"] += (multicore - task.get("Multicore")) * memoryPerCore
+                self.wfSchema[key]["TimePerEvent"] /= (multicore / task.get("Multicore"))
+                self.wfSchema[key]["Multicore"] = multicore
+
+        except Exception as error:
+            self.logger.error("Failed to set multicore to schema")
+            self.logger.error(str(error))
+
+    def setParamValue(self, key: str, value: Any, task: Optional[str] = None) -> None:
+        """
+        The function to set a value for a given param
+        :param key: key name
+        :param value: new value
+        :param task: optional task name
+        """
+        try:
+            if task is None:
+                self.wfSchema[key] = value
+            elif task in self.wfSchema:
+                self.wfSchema[task][key] = value
+        
+        except Exception as error:
+            self.logger.error("Failed to set value to %s on schema", key)
+            self.logger.error(str(error))
+
+    def setNoOutput(self) -> None:
+        """
+        The function to set not keeping the output in the schema
+        """
+        try:
+            for key in self.chainKeys[:-1]:
+                self.wfSchema[key]["KeepOutput"] = False
+            
+            self.wfSchema["TaskChain"] = len(self.chainKeys) - 1
+            self.wfSchema.pop(self.chainKeys.pop())
+        
+        except Exception as error:
+            self.logger.error("Failed to set no output to schema")
+            self.logger.error(str(error))
+
+    def shortenTaskName(self) -> None:
+        """
+        The function to shorten the tasks names
+        """
+        try:
+            newShortNames = {}
+            for key, task in filterKeys(self.chainKeys, self.wfSchema).items():
+                taskName = task.get("TaskName")
+                shortName = T.format(re.findall(r'\d+', taskName)[0])
+
+                newShortNames[taskName] = shortName
+                self.wfSchema[key]["TaskName"] = shortName
+
+            for param in ["ProcessingString", "AcquisitionEra"]:
+                for key in self.wfSchema.get(param, {}).keys():
+                    self.wfSchema[param][newShortNames[key]] = self.wfSchema[param].pop(key)
+            
+        except Exception as error:
+            self.logger.error("Failed to shorten the tasks names")
+            self.logger.error(str(error))
+    
+    

@@ -10,15 +10,16 @@ import unittest
 from unittest.mock import patch, mock_open, MagicMock
 from collections import Counter
 
-from WorkflowMgmt.WorkflowController import WorkflowController
+from MongoControllers.CampaignController import CampaignController
 
+from WorkflowMgmt.WorkflowController import WorkflowController
 from WorkflowMgmt.WorkflowSchemaHandlers.BaseWfSchemaHandler import BaseWfSchemaHandler
 from WorkflowMgmt.WorkflowSchemaHandlers.StepChainWfSchemaHandler import StepChainWfSchemaHandler
 from WorkflowMgmt.WorkflowSchemaHandlers.TaskChainWfSchemaHandler import TaskChainWfSchemaHandler
 
 
 class WorkflowControllerTest(unittest.TestCase):
-    rucioConfig = {"account": os.getenv("RUCIO_ACCOUNT")}
+    realCampaignController = CampaignController()
 
     # This workflow is a monte carlo request. Use it for testing functions depending on the request type as well as splittings functions.
     mcParams = {
@@ -158,21 +159,26 @@ class WorkflowControllerTest(unittest.TestCase):
         "lumiList": {"344068": [[1, 1512]]},
     }
 
-    def setUp(self) -> None:
-        self.mcWfController = WorkflowController(self.mcParams.get("workflow"), rucioConfig=self.rucioConfig)
+    @patch("MongoControllers.CampaignController.CampaignController.__init__")
+    @patch("WorkflowMgmt.SiteController.SiteController.__init__")
+    def setUp(self, mockSite: MagicMock, mockCampaign: MagicMock) -> None:
+        mockCampaign.side_effect = [None] * 5
+        mockSite.side_effect = [None] * 5
 
-        self.rerecoWfController = WorkflowController(self.rerecoParams.get("workflow"), rucioConfig=self.rucioConfig)
+        self.mcWfController = WorkflowController(self.mcParams.get("workflow"))
+
+        self.rerecoWfController = WorkflowController(self.rerecoParams.get("workflow"))
 
         self.stepChainWfController = WorkflowController(
             self.stepChainParams.get("workflow"), rucioConfig=self.rucioConfig
         )
 
         self.redigiTaskChainWfController = WorkflowController(
-            self.redigiTaskChainParams.get("workflow"), rucioConfig=self.rucioConfig
+            self.redigiTaskChainParams.get("workflow")
         )
 
         self.relvalTaskChainWfController = WorkflowController(
-            self.relvalTaskChainParams.get("workflow"), rucioConfig=self.rucioConfig
+            self.relvalTaskChainParams.get("workflow")
         )
 
         super().setUp()
@@ -253,6 +259,9 @@ class WorkflowControllerTest(unittest.TestCase):
 
     def testGo(self) -> None:
         """go checks if a workflow is allowed to go"""
+        self.mcWfController.campaignController = self.realCampaignController
+        self.relvalTaskChainWfController.campaignController = self.realCampaignController
+
         # Test when go is True
         response = self.mcWfController.go()
         isBool = isinstance(response, bool)
@@ -928,10 +937,10 @@ class WorkflowControllerTest(unittest.TestCase):
         isFound = response.get("campaign") == self.mcParams.get("campaign")
         self.assertTrue(isFound)
 
-    def testCheckSplittingsSize(self) -> None:
-        """checkSplitting checks the splittings"""
+    def testcheckSplittingss(self) -> None:
+        """checkSplittings checks the splittings"""
         ### Test when base request
-        response = self.mcWfController.checkSplitting()
+        response = self.mcWfController.checkSplittings()
         isTuple = isinstance(response, tuple)
         self.assertTrue(isTuple)
 
@@ -946,7 +955,7 @@ class WorkflowControllerTest(unittest.TestCase):
         self.assertTrue(isEmpty)
 
         ### Test when step chain request
-        response = self.stepChainWfController.checkSplitting()
+        response = self.stepChainWfController.checkSplittings()
         isTuple = isinstance(response, tuple)
         self.assertTrue(isTuple)
 
@@ -961,7 +970,7 @@ class WorkflowControllerTest(unittest.TestCase):
         self.assertTrue(isEmpty)
 
         ### Test when task chain request
-        response = self.redigiTaskChainWfController.checkSplitting()
+        response = self.redigiTaskChainWfController.checkSplittings()
         isTuple = isinstance(response, tuple)
         self.assertTrue(isTuple)
 

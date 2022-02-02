@@ -1,7 +1,26 @@
+import re
 from collections import defaultdict
+from Utilities.IteratorTools import mapValues, filterKeys
+
 from typing import Optional, List, Tuple
 
-from Utilities.IteratorTools import mapValues, filterKeys
+
+def countLumisPerFile(filesPerLumis: dict) -> dict:
+    """
+    The function to count the number of lumis per file
+    :param filesPerLumis: dict of files by lumis
+    :return: dict of lumis by files
+    """
+    try:
+        lumisPerFile = defaultdict(int)
+        for _, files in filesPerLumis.items():
+            for file in files:
+                lumisPerFile[file] += 1
+        return lumisPerFile
+
+    except Exception as error:
+        print("Failed to count lumis per file")
+        print(str(error))
 
 
 def filterRecoveryFilesAndLocations(recoveryDocs: List[dict], suffixTaskFilter: Optional[str] = None) -> dict:
@@ -120,19 +139,100 @@ def filterSplittingsParam(splittings: List[dict]) -> List[dict]:
     return cleanSplittings
 
 
+def filterWorkflowSchemaParam(wfSchema: dict) -> dict:
+    """
+    The function to drop params from a given workflow schema
+    :param wfSchema: workflow schema
+    :return: cleaned workflow schema
+    """
+    try:
+        paramsToDrop = [
+            "BlockCloseMaxEvents",
+            "BlockCloseMaxFiles",
+            "BlockCloseMaxSize",
+            "BlockCloseMaxWaitTime",
+            "CouchWorkloadDBName",
+            "CustodialGroup",
+            "CustodialSubType",
+            "Dashboard",
+            "GracePeriod",
+            "HardTimeout",
+            "InitialPriority",
+            "inputMode",
+            "MaxMergeEvents",
+            "MaxMergeSize",
+            "MaxRSS",
+            "MaxVSize",
+            "MinMergeSize",
+            "NonCustodialGroup",
+            "NonCustodialSubType",
+            "OutputDatasets",
+            "ReqMgr2Only",
+            "RequestDate" "RequestorDN",
+            "RequestName",
+            "RequestStatus",
+            "RequestTransition",
+            "RequestWorkflow",
+            "SiteWhitelist",
+            "SoftTimeout",
+            "SoftwareVersions",
+            "SubscriptionPriority",
+            "Team",
+            "timeStamp",
+            "TrustSitelists",
+            "TrustPUSitelists",
+            "TotalEstimatedJobs",
+            "TotalInputEvents",
+            "TotalInputLumis",
+            "TotalInputFiles",
+            "DN",
+            "AutoApproveSubscriptionSites",
+            "NonCustodialSites",
+            "CustodialSites",
+            "OriginalRequestName",
+            "IgnoredOutputModules",
+            "OutputModulesLFNBases",
+            "SiteBlacklist",
+            "AllowOpportunistic",
+            "_id",
+            "min_merge_size",
+            "events_per_lumi",
+            "max_merge_size",
+            "max_events_per_lumi",
+            "max_merge_events",
+            "max_wait_time",
+            "events_per_job",
+            "SiteBlacklist",
+            "AllowOpportunistic",
+            "Override",
+            "RequiresGPU"
+        ]
+        paramsToKeep = set(wfSchema.keys()) - set(paramsToDrop)
+        wfSchema = filterKeys(paramsToKeep, wfSchema)
+
+        # EventsPerJob should be dropped for ReqMgr to update it according to TimePerEvent
+        if wfSchema.get("RequestType") == "StepChain":
+            taskParamsToDrop = ["EventsPerJob"]
+            taskKeys = sorted(filter(re.compile(f"^Step\d+$").search, wfSchema))
+            for key, task in filterKeys(taskKeys, wfSchema).items():
+                taskParamsToKeep = set(task.keys()) - set(taskParamsToDrop)
+                wfSchema[key] = filterKeys(taskParamsToKeep, task)
+
+        return wfSchema
+
+    except Exception as error:
+        print("Failed to clean workflow schema")
+        print(str(error))
+
+
 def sortByWakeUpPriority(agents: dict) -> list:
     """
     The function to get the wake up priority list of the given agents sorted by the defined metric
     :param agents: agents info
     :return: agents names sorted by priority for waking up
     """
-    try:
-        wakeUpMetric = lambda v: v.get("TotalIdleJobs", 0) - v.get("TotalRunningJobs", 0)
-        return [name for name in sorted(mapValues(wakeUpMetric, agents), key=lambda x: x[1], reverse=True)]
-
-    except Exception as error:
-        print("Failed to sort agents by wake up metric")
-        print(str(error))
+    wakeUpMetric = lambda v: v.get("TotalIdleJobs", 0) - v.get("TotalRunningJobs", 0)
+    return [name for name in sorted(mapValues(wakeUpMetric, agents), key=lambda x: x[1], reverse=True)]
 
 
 def flattenTaskTree(task: str, **selectParam) -> list:
@@ -142,24 +242,17 @@ def flattenTaskTree(task: str, **selectParam) -> list:
     :param selectParam: optional selection params
     :return: list of tasks
     """
-    try:
-        allTasks = []
-        if selectParam:
-            for k, v in selectParam.items():
-                if (isinstance(v, list) and getattr(task, k) in v) or (
-                    not isinstance(v, list) and getattr(task, k) == v
-                ):
-                    allTasks.append(task)
-                    break
-        else:
-            allTasks.append(task)
+    allTasks = []
+    if selectParam:
+        for k, v in selectParam.items():
+            if (isinstance(v, list) and getattr(task, k) in v) or (not isinstance(v, list) and getattr(task, k) == v):
+                allTasks.append(task)
+                break
+    else:
+        allTasks.append(task)
 
-        for child in task.tree.childNames:
-            childSpec = getattr(task.tree.children, child)
-            allTasks.extend(flattenTaskTree(childSpec, **selectParam))
+    for child in task.tree.childNames:
+        childSpec = getattr(task.tree.children, child)
+        allTasks.extend(flattenTaskTree(childSpec, **selectParam))
 
-        return allTasks
-
-    except Exception as error:
-        print("Failed to flatten task tree to list")
-        print(str(error))
+    return allTasks

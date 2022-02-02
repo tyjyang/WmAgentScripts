@@ -1,11 +1,11 @@
-import logging
 from logging import Logger
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
-from typing import Optional
-
 from Databases.Oracle import OracleDB
+from Utilities.Logging import getLogger
+
+from typing import Optional
 
 
 class OracleClient(object):
@@ -14,25 +14,18 @@ class OracleClient(object):
     General API for connecting to Oracle
     """
 
-    def __init__(self, adminMode: bool = False, logger: Optional[Logger] = None) -> None:
+    def __init__(self, logger: Optional[Logger] = None) -> None:
         try:
             super().__init__()
-            logging.basicConfig(level=logging.INFO)
-            self.logger = logger or logging.getLogger(self.__class__.__name__)
-
+            self.logger = logger or getLogger(self.__class__.__name__)
             self.base = OracleDB.Base
-            self.adminMode = adminMode
 
-            with open(f"src/python/Utilities/secret_cmsr_{'admin' if self.adminMode else 'rw'}.txt", "r") as file:
+            with open(f"/afs/cern.ch/user/c/cmsunified/private/unifiedPy3Secrets/secret_cmsr_rw.txt", "r") as file:
                 self.oracleUrl = file.read().strip()
 
             self.engine = create_engine(self.oracleUrl)
-            if self.adminMode:
-                self.engine = self.engine.execution_options(schema_translate_map={self.base.schema: None})
-
             self.base.metadata.create_all(self.engine)
             self.base.metadata.bind = self.engine
-
             self.session = self.startSession()
 
         except Exception as error:
